@@ -1,0 +1,12 @@
+{
+  "public_host": "1.2.3.4",
+  "panel_port": 18080,
+  "panel_user": "admin",
+  "proxy_user": "proxy",
+  "port_start": 30000,
+  "max_proxies": 32,
+  "iface": "enp0s6",
+  "vnic_id": "ocid1.vnic...",
+  "subnet_id": "ocid1.subnet...",
+  "force_ipv6": true
+}
