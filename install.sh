@@ -37,6 +37,9 @@ cat > "$INSTALL_DIR/config.json" <<JSON
   "iface": "$IFACE",
   "vnic_id": "",
   "subnet_id": "",
+  "instance_id": "",
+  "compartment_id": "",
+  "max_vnics": 4,
   "force_ipv6": true
 }
 JSON
