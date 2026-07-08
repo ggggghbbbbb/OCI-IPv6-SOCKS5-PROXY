@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, time, subprocess
+import os, json, time, subprocess, secrets, string
 from functools import wraps
 from flask import Flask, request, jsonify, Response, render_template_string
 import oci
@@ -93,6 +93,10 @@ def next_port(s):
     for p in range(start,end+1):
         if p not in used: return p
     return None
+
+def random_text(prefix='', n=16):
+    alphabet='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    return prefix + ''.join(secrets.choice(alphabet) for _ in range(n))
 
 def proxy_uri(item):
     c=cfg(); host=c.get('public_host','127.0.0.1'); u=item.get('username') or c.get('proxy_user'); p=item.get('password') or c.get('proxy_pass')
@@ -195,6 +199,18 @@ def api_vnic_delete():
     try: compute_client().detach_vnic(v['attachment_id'])
     except Exception as e: return jsonify({'ok':False,'error':str(e)}),500
     save_vnics([x for x in vnics() if x.get('vnic_id')!=vid]); return jsonify({'ok':True})
+@app.route('/api/proxy_credentials/random',methods=['POST'])
+@require_auth
+def api_proxy_credentials_random():
+    data=request.json or {}; c=cfg()
+    c['proxy_user']=random_text('u_',10); c['proxy_pass']=random_text('p_',18)
+    s=state()
+    if data.get('apply_existing', True):
+        for it in s: it['username']=c['proxy_user']; it['password']=c['proxy_pass']
+        save_state(s)
+    save_cfg(c)
+    return jsonify({'ok':True,'proxy_user':c['proxy_user'],'proxy_pass':c['proxy_pass'],'updated_existing':bool(data.get('apply_existing', True)),'restart':restart_proxy()})
+
 @app.route('/api/config',methods=['POST'])
 @require_auth
 def api_config():
