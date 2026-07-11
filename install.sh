@@ -4,8 +4,8 @@ INSTALL_DIR=/opt/oci-ipv6-proxy-panel
 if [ "$(id -u)" -ne 0 ]; then echo "请用 root 运行：sudo bash install.sh"; exit 1; fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y python3-venv python3-pip curl iproute2
-mkdir -p "$INSTALL_DIR"/{secure,data,templates}
+apt-get install -y python3-venv python3-pip curl iproute2 xz-utils
+mkdir -p "$INSTALL_DIR"/{secure,data,templates,bin}
 chmod 700 "$INSTALL_DIR/secure"
 cp -r app/app.py app/socks_server.py app/ss_config.py "$INSTALL_DIR/"
 cp app/templates/index.html "$INSTALL_DIR/templates/index.html"
@@ -49,6 +49,17 @@ cat > "$INSTALL_DIR/config.json" <<JSON
 }
 JSON
 [ -f "$INSTALL_DIR/data/proxies.json" ] || echo '[]' > "$INSTALL_DIR/data/proxies.json"
+ARCH=$(dpkg --print-architecture)
+case "$ARCH" in amd64) SS_ARCH=x86_64;; arm64) SS_ARCH=aarch64;; *) echo "暂不支持的 Shadowsocks 架构：$ARCH"; exit 1;; esac
+SS_VERSION=v1.24.0
+SS_FILE="shadowsocks-${SS_VERSION}-${SS_ARCH}-unknown-linux-gnu.tar.xz"
+TMP_SS=$(mktemp -d)
+curl -fsSL "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_VERSION}/${SS_FILE}" -o "$TMP_SS/$SS_FILE"
+curl -fsSL "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_VERSION}/${SS_FILE}.sha256" -o "$TMP_SS/$SS_FILE.sha256"
+(cd "$TMP_SS" && sha256sum -c "$SS_FILE.sha256" && tar -xJf "$SS_FILE")
+install -m 755 "$TMP_SS/ssserver" "$INSTALL_DIR/bin/ssserver"
+rm -rf "$TMP_SS"
+python3 "$INSTALL_DIR/ss_config.py"
 cat > /etc/systemd/system/oci-ipv6-proxy-panel.service <<EOF
 [Unit]
 Description=OCI IPv6 Proxy Pool Web Panel
@@ -78,8 +89,23 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+cat > /etc/systemd/system/oci-ipv6-ss.service <<EOF
+[Unit]
+Description=OCI IPv6 Shadowsocks Proxy Service
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/bin/ssserver -c $INSTALL_DIR/data/shadowsocks.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+EOF
 systemctl daemon-reload
-systemctl enable --now oci-ipv6-socks.service oci-ipv6-proxy-panel.service
+systemctl enable --now oci-ipv6-socks.service oci-ipv6-ss.service oci-ipv6-proxy-panel.service
 cat <<MSG
 安装完成：
 面板：http://$PUBLIC_HOST:$PANEL_PORT
