@@ -7,9 +7,9 @@ apt-get update -y
 apt-get install -y python3-venv python3-pip curl iproute2
 mkdir -p "$INSTALL_DIR"/{secure,data,templates}
 chmod 700 "$INSTALL_DIR/secure"
-cp -r app/app.py app/socks_server.py "$INSTALL_DIR/"
+cp -r app/app.py app/socks_server.py app/ss_config.py "$INSTALL_DIR/"
 cp app/templates/index.html "$INSTALL_DIR/templates/index.html"
-chmod +x "$INSTALL_DIR/app.py" "$INSTALL_DIR/socks_server.py"
+chmod +x "$INSTALL_DIR/app.py" "$INSTALL_DIR/socks_server.py" "$INSTALL_DIR/ss_config.py"
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install -q flask oci gunicorn
@@ -42,7 +42,10 @@ cat > "$INSTALL_DIR/config.json" <<JSON
   "instance_id": "",
   "compartment_id": "",
   "max_vnics": 4,
-  "force_ipv6": true
+  "force_ipv6": true,
+  "ss_port_start": 31000,
+  "ss_method": "aes-256-gcm",
+  "ss_password": "$(openssl rand -base64 24 2>/dev/null | tr -d '\n' || date +%s)"
 }
 JSON
 [ -f "$INSTALL_DIR/data/proxies.json" ] || echo '[]' > "$INSTALL_DIR/data/proxies.json"

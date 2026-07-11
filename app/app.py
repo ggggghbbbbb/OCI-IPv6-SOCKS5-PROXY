@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, time, subprocess, secrets, string
+import os, json, time, subprocess, secrets, string, base64
 from urllib.parse import quote
 from functools import wraps
 from flask import Flask, request, jsonify, Response, render_template_string
@@ -9,6 +9,7 @@ from oci.exceptions import ServiceError
 
 BASE=os.environ.get('OCI_PROXY_BASE','/opt/oci-ipv6-proxy-panel')
 CONFIG=f'{BASE}/config.json'; STATE=f'{BASE}/data/proxies.json'; VNICS=f'{BASE}/data/vnics.json'
+SS_CONFIG=f'{BASE}/data/shadowsocks.json'; SS_GENERATOR=f'{BASE}/ss_config.py'
 OCI_CONFIG=f'{BASE}/secure/oci_config'; OCI_KEY=f'{BASE}/secure/oci_api_key.pem'
 # Runtime values are loaded from config.json / environment.
 # Do not hardcode real OCIDs in source control.
@@ -89,6 +90,9 @@ def del_os_ip(ip, iface=None, table=None):
     run(f'ip -6 rule del from {ip}/128 table {table} priority {10000+table} 2>/dev/null || true')
     return 'OK'
 def restart_proxy(): return run('systemctl restart oci-ipv6-socks.service && sleep 1 && systemctl is-active oci-ipv6-socks.service', timeout=25)
+def restart_ss():
+    run(f'python3 {SS_GENERATOR}', timeout=25)
+    return run('systemctl restart oci-ipv6-ss.service && sleep 1 && systemctl is-active oci-ipv6-ss.service', timeout=25)
 
 def next_port(s):
     c=cfg(); start=int(c.get('port_start',30000)); end=int(c.get('port_end',30127)); used={int(x['port']) for x in s}
@@ -137,32 +141,35 @@ def yaml_value(value):
     """JSON strings are valid YAML strings and safely preserve special characters."""
     return json.dumps(str(value), ensure_ascii=False)
 
-def clash_config(items):
-    proxies=[]
-    names=[]
+def clash_config(items, protocol='socks5'):
+    proxies=[]; names=[]; c=cfg(); host=c.get('public_host','127.0.0.1')
     for item in items:
-        name=f'OCI SOCKS5 {item["port"]}'
+        port=ss_port(item) if protocol == 'ss' else int(item['port'])
+        name=f'OCI {"SS" if protocol == "ss" else "SOCKS5"} {port}'
         names.append(name)
-        c=cfg(); host=c.get('public_host','127.0.0.1')
-        proxies.extend([
-            f'  - name: {yaml_value(name)}',
-            '    type: socks5',
-            f'    server: {yaml_value(host)}',
-            f'    port: {int(item["port"])}',
-            f'    username: {yaml_value(item.get("username") or c.get("proxy_user", ""))}',
-            f'    password: {yaml_value(item.get("password") or c.get("proxy_pass", ""))}',
-            '    udp: true',
-        ])
-    group=['  - name: "OCI IPv6 SOCKS5"','    type: select','    proxies:'] + [f'      - {yaml_value(name)}' for name in names]
-    return '\n'.join(['mixed-port: 7890','allow-lan: false','mode: rule','log-level: info','proxies:'] + proxies + ['proxy-groups:'] + group + ['rules:','  - MATCH,OCI IPv6 SOCKS5',''])
+        proxies.extend([f'  - name: {yaml_value(name)}', f'    type: {"ss" if protocol == "ss" else "socks5"}',
+                        f'    server: {yaml_value(host)}', f'    port: {port}'])
+        if protocol == 'ss':
+            proxies.extend([f'    cipher: {yaml_value(c.get("ss_method","aes-256-gcm"))}', f'    password: {yaml_value(c.get("ss_password",""))}', '    udp: true'])
+        else:
+            proxies.extend([f'    username: {yaml_value(item.get("username") or c.get("proxy_user", ""))}', f'    password: {yaml_value(item.get("password") or c.get("proxy_pass", ""))}', '    udp: true'])
+    label='OCI Shadowsocks' if protocol == 'ss' else 'OCI IPv6 SOCKS5'
+    group=[f'  - name: {yaml_value(label)}','    type: select','    proxies:'] + [f'      - {yaml_value(name)}' for name in names]
+    return '\n'.join(['mixed-port: 7890','allow-lan: false','mode: rule','log-level: info','proxies:'] + proxies + ['proxy-groups:'] + group + ['rules:',f'  - MATCH,{label}',''])
 
 def proxy_uri(item):
     c=cfg(); host=c.get('public_host','127.0.0.1'); u=item.get('username') or c.get('proxy_user'); p=item.get('password') or c.get('proxy_pass')
     return f'socks5://{u}:{p}@{host}:{item["port"]}' if u and p else f'socks5://{host}:{item["port"]}'
+def ss_port(item):
+    c=cfg(); return int(item.get('ss_port') or int(c.get('ss_port_start',31000)) + int(item['port'])-int(c.get('port_start',30000)))
+def ss_uri(item):
+    c=cfg(); method=c.get('ss_method','aes-256-gcm'); password=c.get('ss_password','')
+    host=c.get('public_host','127.0.0.1'); credential=base64.urlsafe_b64encode(f'{method}:{password}'.encode()).decode().rstrip('=')
+    return f'ss://{credential}@{host}:{ss_port(item)}#{quote("OCI-SS-"+str(item["port"]))}'
 def enrich(items):
     ensure_subscription_ids(items)
     token=subscription_token()
-    return [{**x,'uri':proxy_uri(x),'can_rotate':not x.get('protected',False),
+    return [{**x,'uri':proxy_uri(x),'ss_uri':ss_uri(x),'ss_port':ss_port(x),'can_rotate':not x.get('protected',False),
              'subscription_url':subscription_url(token,[x['subscription_id']])} for x in items]
 
 def vnic_counts():
@@ -206,7 +213,7 @@ def api_add():
             item={'id':obj.id,'subscription_id':secrets.token_urlsafe(12),'ip':obj.ip_address,'port':port,'username':cfg().get('proxy_user','proxy'),'password':cfg().get('proxy_pass','proxy'),'created':time.strftime('%F %T'),'protected':False,'vnic_id':v['vnic_id'],'subnet_id':v['subnet_id'],'iface':v['iface'],'os_add':add_os_ip(obj.ip_address,v['iface'],int(v.get('table',100)))}
             s.append(item); save_state(s); made.append({**item,'uri':proxy_uri(item)})
         except Exception as e: errors.append(str(e)); break
-    return jsonify({'ok':True,'added':made,'errors':errors,'restart':restart_proxy()})
+    return jsonify({'ok':True,'added':made,'errors':errors,'restart':restart_proxy(),'ss_restart':restart_ss()})
 @app.route('/api/rotate',methods=['POST'])
 @require_auth
 def api_rotate():
@@ -218,7 +225,7 @@ def api_rotate():
     try:
         obj=create_oci_ipv6(item['vnic_id'],item['subnet_id'],'proxy-panel-rotated-ipv6')
         item.update({'id':obj.id,'ip':obj.ip_address,'rotated':time.strftime('%F %T'),'os_add':add_os_ip(obj.ip_address,item.get('iface'),table)})
-        s[idx]=item; save_state(s); return jsonify({'ok':True,'old':old,'new':{**item,'uri':proxy_uri(item)},'delete_error':derr,'restart':restart_proxy()})
+        s[idx]=item; save_state(s); return jsonify({'ok':True,'old':old,'new':{**item,'uri':proxy_uri(item)},'delete_error':derr,'restart':restart_proxy(),'ss_restart':restart_ss()})
     except Exception as e:
         s.pop(idx); save_state(s); restart_proxy(); return jsonify({'ok':False,'error':f'旧 IPv6 已释放，但新 IPv6 创建失败：{e}','old':old,'delete_error':derr}),500
 @app.route('/api/delete',methods=['POST'])
@@ -228,7 +235,7 @@ def api_delete():
     if not item: return jsonify({'ok':False,'error':'not found'}),404
     del_os_ip(item['ip'],item.get('iface'),table_for(item)); err=None
     if not item.get('protected'): err=delete_oci_ipv6(item['id'])
-    save_state([x for x in s if x['id']!=oid]); return jsonify({'ok':True,'delete_error':err,'restart':restart_proxy()})
+    save_state([x for x in s if x['id']!=oid]); return jsonify({'ok':True,'delete_error':err,'restart':restart_proxy(),'ss_restart':restart_ss()})
 @app.route('/api/vnics/add',methods=['POST'])
 @require_auth
 def api_vnic_add():
@@ -299,9 +306,10 @@ def subscription(token):
     keys=[x for x in raw.split(',') if x] if raw else None
     items=selected_subscription_items(keys)
     is_clash=request.args.get('format','').lower() == 'clash'
-    body=clash_config(items) if is_clash else '\n'.join(proxy_uri(item) for item in items)+'\n'
+    protocol='ss' if request.args.get('protocol','').lower() == 'ss' else 'socks5'
+    body=clash_config(items, protocol) if is_clash else '\n'.join(ss_uri(item) if protocol == 'ss' else proxy_uri(item) for item in items)+'\n'
     mimetype='text/yaml; charset=utf-8' if is_clash else 'text/plain; charset=utf-8'
-    filename='oci-socks5-clash.yaml' if is_clash else 'oci-socks5-subscription.txt'
+    filename=('oci-ss' if protocol == 'ss' else 'oci-socks5') + ('-clash.yaml' if is_clash else '-subscription.txt')
     response=Response(body, mimetype=mimetype)
     response.headers['Content-Disposition']=f'inline; filename="{filename}"'
     response.headers['Cache-Control']='no-store'
