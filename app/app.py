@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, json, time, subprocess, secrets, string
+from urllib.parse import quote
 from functools import wraps
 from flask import Flask, request, jsonify, Response, render_template_string
 import oci
@@ -45,7 +46,8 @@ def require_auth(fn):
     return wrapper
 
 def public_config(c=None):
-    c=c or cfg(); return {k:v for k,v in c.items() if 'pass' not in k.lower() and 'secret' not in k.lower()}
+    c=c or cfg()
+    return {k:v for k,v in c.items() if 'pass' not in k.lower() and 'secret' not in k.lower() and k != 'subscription_token'}
 def oci_conf(): return oci.config.from_file(OCI_CONFIG)
 def net_client(): return oci.core.VirtualNetworkClient(oci_conf())
 def compute_client(): return oci.core.ComputeClient(oci_conf())
@@ -98,10 +100,44 @@ def random_text(prefix='', n=16):
     alphabet='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
     return prefix + ''.join(secrets.choice(alphabet) for _ in range(n))
 
+def subscription_token():
+    """Create one opaque, revocable token for public read-only subscriptions."""
+    c=cfg(); token=c.get('subscription_token','')
+    if not token:
+        token=secrets.token_urlsafe(32)
+        c['subscription_token']=token
+        save_cfg(c)
+    return token
+
+def ensure_subscription_ids(items=None):
+    """Keep selection IDs stable when an OCI IPv6 object is rotated."""
+    items=state() if items is None else items
+    changed=False
+    for item in items:
+        if not item.get('subscription_id'):
+            item['subscription_id']=secrets.token_urlsafe(12)
+            changed=True
+    if changed: save_state(items)
+    return items
+
+def selected_subscription_items(keys=None):
+    items=ensure_subscription_ids()
+    if not keys: return items
+    wanted=set(keys)
+    return [item for item in items if item.get('subscription_id') in wanted]
+
+def subscription_url(token, keys=None):
+    base=request.host_url.rstrip('/') + '/subscribe/' + quote(token, safe='')
+    return base + ('?ids=' + quote(','.join(keys), safe=',') if keys else '')
+
 def proxy_uri(item):
     c=cfg(); host=c.get('public_host','127.0.0.1'); u=item.get('username') or c.get('proxy_user'); p=item.get('password') or c.get('proxy_pass')
     return f'socks5://{u}:{p}@{host}:{item["port"]}' if u and p else f'socks5://{host}:{item["port"]}'
-def enrich(items): return [{**x,'uri':proxy_uri(x),'can_rotate':not x.get('protected',False)} for x in items]
+def enrich(items):
+    ensure_subscription_ids(items)
+    token=subscription_token()
+    return [{**x,'uri':proxy_uri(x),'can_rotate':not x.get('protected',False),
+             'subscription_url':subscription_url(token,[x['subscription_id']])} for x in items]
 
 def vnic_counts():
     counts={v.get('vnic_id'):0 for v in vnics()}
@@ -119,9 +155,11 @@ def index(): return render_template_string(open(f'{BASE}/templates/index.html').
 @app.route('/api/status')
 @require_auth
 def api_status():
-    c=cfg(); counts=vnic_counts(); vlist=[]
+    items=ensure_subscription_ids(); c=cfg(); counts=vnic_counts(); vlist=[]
     for v in vnics(): vlist.append({**v,'count':counts.get(v.get('vnic_id'),0)})
-    return jsonify({'config':public_config(c),'count':len(state()),'max':c.get('max_proxies',len(vlist)*32),'proxies':enrich(state()),'vnics':vlist,'proxy_service':run('systemctl is-active oci-ipv6-socks.service || true'),'panel_service':run('systemctl is-active oci-ipv6-proxy-panel.service || true')})
+    return jsonify({'config':public_config(c),'count':len(items),'max':c.get('max_proxies',len(vlist)*32),'proxies':enrich(items),'vnics':vlist,
+                    'subscriptions':{'all_url':subscription_url(subscription_token())},
+                    'proxy_service':run('systemctl is-active oci-ipv6-socks.service || true'),'panel_service':run('systemctl is-active oci-ipv6-proxy-panel.service || true')})
 @app.route('/api/add',methods=['POST'])
 @require_auth
 def api_add():
@@ -139,7 +177,7 @@ def api_add():
         if not v or not port: errors.append('指定/可用 VNIC 容量不足或端口已满'); break
         try:
             obj=create_oci_ipv6(v['vnic_id'],v['subnet_id'])
-            item={'id':obj.id,'ip':obj.ip_address,'port':port,'username':cfg().get('proxy_user','proxy'),'password':cfg().get('proxy_pass','proxy'),'created':time.strftime('%F %T'),'protected':False,'vnic_id':v['vnic_id'],'subnet_id':v['subnet_id'],'iface':v['iface'],'os_add':add_os_ip(obj.ip_address,v['iface'],int(v.get('table',100)))}
+            item={'id':obj.id,'subscription_id':secrets.token_urlsafe(12),'ip':obj.ip_address,'port':port,'username':cfg().get('proxy_user','proxy'),'password':cfg().get('proxy_pass','proxy'),'created':time.strftime('%F %T'),'protected':False,'vnic_id':v['vnic_id'],'subnet_id':v['subnet_id'],'iface':v['iface'],'os_add':add_os_ip(obj.ip_address,v['iface'],int(v.get('table',100)))}
             s.append(item); save_state(s); made.append({**item,'uri':proxy_uri(item)})
         except Exception as e: errors.append(str(e)); break
     return jsonify({'ok':True,'added':made,'errors':errors,'restart':restart_proxy()})
@@ -225,6 +263,20 @@ def api_config():
 @app.route('/api/export')
 @require_auth
 def api_export(): return Response('\n'.join(proxy_uri(x) for x in state())+'\n',mimetype='text/plain; charset=utf-8')
+
+@app.route('/subscribe/<token>')
+def subscription(token):
+    """Public read-only endpoint protected by the high-entropy URL token."""
+    if not secrets.compare_digest(token, subscription_token()):
+        return Response('Not found\n', status=404, mimetype='text/plain')
+    raw=request.args.get('ids','').strip()
+    keys=[x for x in raw.split(',') if x] if raw else None
+    items=selected_subscription_items(keys)
+    response=Response('\n'.join(proxy_uri(item) for item in items)+'\n', mimetype='text/plain; charset=utf-8')
+    response.headers['Content-Disposition']='inline; filename="oci-socks5-subscription.txt"'
+    response.headers['Cache-Control']='no-store'
+    return response
+
 @app.route('/api/restart',methods=['POST'])
 @require_auth
 def api_restart(): return jsonify({'ok':True,'restart':restart_proxy()})
