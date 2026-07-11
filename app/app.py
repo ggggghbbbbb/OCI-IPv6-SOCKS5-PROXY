@@ -126,9 +126,35 @@ def selected_subscription_items(keys=None):
     wanted=set(keys)
     return [item for item in items if item.get('subscription_id') in wanted]
 
-def subscription_url(token, keys=None):
+def subscription_url(token, keys=None, fmt=None):
     base=request.host_url.rstrip('/') + '/subscribe/' + quote(token, safe='')
-    return base + ('?ids=' + quote(','.join(keys), safe=',') if keys else '')
+    params=[]
+    if keys: params.append('ids=' + quote(','.join(keys), safe=','))
+    if fmt == 'clash': params.append('format=clash')
+    return base + ('?' + '&'.join(params) if params else '')
+
+def yaml_value(value):
+    """JSON strings are valid YAML strings and safely preserve special characters."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+def clash_config(items):
+    proxies=[]
+    names=[]
+    for item in items:
+        name=f'OCI SOCKS5 {item["port"]}'
+        names.append(name)
+        c=cfg(); host=c.get('public_host','127.0.0.1')
+        proxies.extend([
+            f'  - name: {yaml_value(name)}',
+            '    type: socks5',
+            f'    server: {yaml_value(host)}',
+            f'    port: {int(item["port"])}',
+            f'    username: {yaml_value(item.get("username") or c.get("proxy_user", ""))}',
+            f'    password: {yaml_value(item.get("password") or c.get("proxy_pass", ""))}',
+            '    udp: true',
+        ])
+    group=['  - name: "OCI IPv6 SOCKS5"','    type: select','    proxies:'] + [f'      - {yaml_value(name)}' for name in names]
+    return '\n'.join(['mixed-port: 7890','allow-lan: false','mode: rule','log-level: info','proxies:'] + proxies + ['proxy-groups:'] + group + ['rules:','  - MATCH,OCI IPv6 SOCKS5',''])
 
 def proxy_uri(item):
     c=cfg(); host=c.get('public_host','127.0.0.1'); u=item.get('username') or c.get('proxy_user'); p=item.get('password') or c.get('proxy_pass')
@@ -272,8 +298,12 @@ def subscription(token):
     raw=request.args.get('ids','').strip()
     keys=[x for x in raw.split(',') if x] if raw else None
     items=selected_subscription_items(keys)
-    response=Response('\n'.join(proxy_uri(item) for item in items)+'\n', mimetype='text/plain; charset=utf-8')
-    response.headers['Content-Disposition']='inline; filename="oci-socks5-subscription.txt"'
+    is_clash=request.args.get('format','').lower() == 'clash'
+    body=clash_config(items) if is_clash else '\n'.join(proxy_uri(item) for item in items)+'\n'
+    mimetype='text/yaml; charset=utf-8' if is_clash else 'text/plain; charset=utf-8'
+    filename='oci-socks5-clash.yaml' if is_clash else 'oci-socks5-subscription.txt'
+    response=Response(body, mimetype=mimetype)
+    response.headers['Content-Disposition']=f'inline; filename="{filename}"'
     response.headers['Cache-Control']='no-store'
     return response
 
